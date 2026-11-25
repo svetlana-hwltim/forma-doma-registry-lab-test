@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-WU0U+AcVn+cV8tJ4nIr6ScC3VZ49DodP4R9QG41E5rM=' https://challenges.cloudflare.com; style-src 'sha256-1Tuze6aqUYl9wJx+FE+YnT9MjlNa6SX+axRZGtkZzVY='; frame-src https://challenges.cloudflare.com; connect-src https://challenges.cloudflare.com https://d5d6976ktt5htt07i4iu.g4vq2kuy.apigw.yandexcloud.net; base-uri 'none'; form-action 'none'">
+  <title>Лабораторный тест реестра заявок</title>
+  <style>
+    body { margin: 0; background: #f3f5f4; color: #18302a; font: 1rem/1.5 system-ui, sans-serif; }
+    main { max-width: 34rem; margin: 1rem auto; padding: 0.75rem; }
+    h1 { margin: 0 0 1rem; padding: 1rem; border-radius: 0.75rem; background: #ffecbd; color: #512d03; font-size: clamp(1.15rem, 5vw, 1.6rem); }
+    form, section { padding: 0.85rem; margin-bottom: 1rem; border: 1px solid #cfdbd5; border-radius: 0.75rem; background: white; }
+    p { margin: 0 0 0.5rem; overflow-wrap: anywhere; }
+    p:last-child { margin-bottom: 0; }
+    button { width: 100%; min-height: 44px; padding: 0.6rem; border: 0; border-radius: 0.5rem; background: #17513e; color: white; font: inherit; }
+    button:disabled { background: #e6ede9; color: #52655b; }
+    #challenge { margin: 0.75rem 0; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>ЛАБОРАТОРНЫЙ ТЕСТ — НЕ РЕАЛЬНАЯ ЗАЯВКА</h1>
+    <form id="fixture" aria-label="Синтетическая заявка">
+      <p>Имя — Registry Lab Fixture</p>
+      <p>Телефон — 0000000000</p>
+      <p>Комментарий — Registry lab synthetic application</p>
+      <p>Тестовое согласие — да</p>
+      <button id="prepare" type="button" disabled>Подготовить проверку</button>
+      <div id="challenge"></div>
+      <button id="send" type="submit" disabled>Отправить тестовую заявку</button>
+    </form>
+    <section role="status" aria-live="polite">
+      <p id="http">HTTP-статус появится после запроса</p>
+      <p id="notice">Для проверки требуется JavaScript.</p>
+    </section>
+  </main>
+  <script>
+    (() => {
+      'use strict';
+
+      const origin = 'https://svetlana-hwltim.github.io';
+      const endpoint = 'https://d5d6976ktt5htt07i4iu.g4vq2kuy.apigw.yandexcloud.net/api/application';
+      const stateKey = 'forma-doma:registry-lab-mobile-test:attempt-v1';
+      const uuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
+      const proof = /^\d{10}\.[a-f0-9-]{36}\.[a-f0-9]{64}$/;
+      const prepare = document.getElementById('prepare');
+      const send = document.getElementById('send');
+      const http = document.getElementById('http');
+      const notice = document.getElementById('notice');
+      const lockedMessage = 'Попытка заблокирована. Перед ручным сбросом сверьте её исход.';
+      let submission;
+      let csrf;
+      let token;
+      let widgetTimer;
+      let challengeClosed = false;
+      let sending = false;
+      let attempted = false;
+
+      function readState() {
+        const raw = localStorage.getItem(stateKey);
+        if (raw === null) return null;
+        const state = JSON.parse(raw);
+        if (state === null || typeof state !== 'object' || Array.isArray(state) ||
+            Object.keys(state).length !== 2 || !Object.hasOwn(state, 'submission') ||
+            !Object.hasOwn(state, 'attempted') ||
+            typeof state.submission !== 'string' || !uuid.test(state.submission) ||
+            typeof state.attempted !== 'boolean') throw new Error();
+        return state;
+      }
+
+      function saveState(id, attempted) {
+        localStorage.setItem(stateKey, JSON.stringify({ submission: id, attempted }));
+      }
+
+      function lockForm() {
+        attempted = true;
+        prepare.disabled = send.disabled = true;
+        csrf = token = null;
+        notice.textContent = lockedMessage;
+      }
+
+      function blockUnavailableState() {
+        lockForm();
+        notice.textContent = 'Состояние попытки недоступно. POST заблокирован.';
+      }
+
+      async function api(method, options, timeout) {
+        http.textContent = method + ' · ожидание ответа';
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeout);
+        try {
+          const response = await fetch(endpoint, {
+            method, ...options, credentials: 'omit', cache: 'no-store', redirect: 'error',
+            signal: controller.signal,
+          });
+          http.textContent = method + ' · HTTP ' + response.status;
+          let data = null;
+          try { data = await response.json(); } catch {}
+          return { status: response.status, data };
+        } catch {
+          http.textContent = method + (controller.signal.aborted ? ' · время ожидания истекло' : ' · сеть или CORS недоступны');
+          return null;
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      function challengeFailed() {
+        clearTimeout(widgetTimer);
+        challengeClosed = true;
+        token = null;
+        send.disabled = true;
+        if (!attempted && !sending) {
+          notice.textContent = 'Проверка Turnstile недоступна или истекла. Обновите страницу для подготовки.';
+        }
+      }
+
+      function loadChallenge() {
+        notice.textContent = 'Ожидание проверки Turnstile.';
+        const script = document.createElement('script');
+        window.onRegistryLabTurnstileReady = () => {
+          if (attempted || challengeClosed) return;
+          clearTimeout(widgetTimer);
+          try {
+            widgetTimer = setTimeout(challengeFailed, 120000);
+            window.turnstile.render('#challenge', {
+              sitekey: '0x4AAAAAAGSVb_UZ01RbRSJB',
+              action: 'registry_lab_application',
+              size: 'flexible',
+              retry: 'never',
+              'refresh-expired': 'never',
+              'refresh-timeout': 'never',
+              'response-field': false,
+              callback(value) {
+                if (attempted || sending || challengeClosed) return;
+                if (typeof value !== 'string' || !value.length || value.length > 2048) {
+                  challengeFailed();
+                  return;
+                }
+                clearTimeout(widgetTimer);
+                token = value;
+                send.disabled = false;
+                notice.textContent = 'Проверка пройдена. Можно отправить одну заявку.';
+              },
+              'error-callback': challengeFailed,
+              'expired-callback': challengeFailed,
+              'timeout-callback': challengeFailed,
+              'unsupported-callback': challengeFailed,
+            });
+          } catch {
+            challengeFailed();
+          }
+        };
+        script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=onRegistryLabTurnstileReady';
+        script.async = true;
+        script.addEventListener('error', challengeFailed);
+        widgetTimer = setTimeout(challengeFailed, 20000);
+        document.head.append(script);
+      }
+
+      const errors = {
+        invalid_request: 'Данные заявки отклонены.',
+        synthetic_only: 'Сервер принимает только синтетические данные.',
+        invalid_csrf: 'Подтверждение формы отклонено.',
+        challenge_failed: 'Сервер отклонил проверку Turnstile.',
+        challenge_unavailable: 'Серверная проверка Turnstile недоступна.',
+        submission_already_used: 'Идентификатор заявки уже использован.',
+        submission_conflict: 'Идентификатор связан с другими данными.',
+        rate_limited: 'Достигнут лимит тестовых заявок.',
+        pending: 'Заявка ещё обрабатывается.',
+        uncertain: 'Исход тестовой отправки неизвестен.',
+        unavailable: 'Лабораторный сервис недоступен.',
+      };
+
+      document.getElementById('fixture').addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (send.disabled || sending || attempted || !csrf || !token) return;
+        sending = true;
+        send.disabled = true;
+        try {
+          await navigator.locks.request(stateKey, async () => {
+            const state = readState();
+            if (!state || state.attempted || state.submission !== submission) {
+              lockForm();
+              return;
+            }
+            if (!csrf || !token) return;
+            const body = JSON.stringify({
+              name: 'Registry Lab Fixture', phone: '0000000000',
+              comment: 'Registry lab synthetic application', consent: true,
+              submission, csrf, turnstileToken: token,
+            });
+            saveState(submission, true);
+            const saved = readState();
+            if (saved?.submission !== submission || saved.attempted !== true) {
+              blockUnavailableState();
+              return;
+            }
+            lockForm();
+
+            const result = await api('POST', { headers: { 'Content-Type': 'application/json' }, body }, 30000);
+            if (result?.status === 200 && result.data?.ok === true) {
+              notice.textContent = 'Лабораторная заявка принята. Доставка смоделирована. ' + lockedMessage;
+              return;
+            }
+            const code = result?.data?.code;
+            const message = result?.data?.ok === false && typeof code === 'string' && Object.hasOwn(errors, code)
+              ? errors[code] : 'Исход тестовой отправки неизвестен.';
+            notice.textContent = message + ' ' + lockedMessage;
+          });
+        } catch {
+          if (attempted) notice.textContent = lockedMessage;
+          else blockUnavailableState();
+        } finally {
+          sending = false;
+        }
+      });
+
+      prepare.addEventListener('click', async () => {
+        if (prepare.disabled || attempted) return;
+        prepare.disabled = true;
+        try {
+          await navigator.locks.request(stateKey, () => {
+            const state = readState();
+            if (state?.attempted) {
+              lockForm();
+              return;
+            }
+            submission = state?.submission ?? crypto.randomUUID();
+            if (!state) saveState(submission, false);
+          });
+        } catch {
+          blockUnavailableState();
+          return;
+        }
+        if (attempted) return;
+
+        const result = await api('GET', {}, 30000);
+        if (attempted) return;
+        if (result?.status !== 200 || typeof result.data?.csrf !== 'string' || !proof.test(result.data.csrf)) {
+          notice.textContent = 'Подготовка лабораторной заявки недоступна. POST не выполнялся.';
+          return;
+        }
+        csrf = result.data.csrf;
+        loadChallenge();
+      });
+
+      if (location.origin !== origin) {
+        notice.textContent = 'Запросы доступны только с https://svetlana-hwltim.github.io.';
+        return;
+      }
+      if (!navigator.locks?.request || !globalThis.crypto?.randomUUID) {
+        notice.textContent = 'Для защиты от повторов нужен браузер с поддержкой Web Locks и генерации UUID.';
+        return;
+      }
+      try {
+        if (readState()?.attempted) {
+          lockForm();
+          return;
+        }
+      } catch {
+        blockUnavailableState();
+        return;
+      }
+
+      window.addEventListener('storage', (event) => {
+        if (event.key !== stateKey && event.key !== null) return;
+        try {
+          if (readState()?.attempted) lockForm();
+        } catch {
+          blockUnavailableState();
+        }
+      });
+      prepare.disabled = false;
+      notice.textContent = 'Нажмите «Подготовить проверку».';
+    })();
+  </script>
+</body>
+</html>
